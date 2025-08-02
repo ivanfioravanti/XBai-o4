@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Tuple, Optional
 import mlx.core as mx
 from mlx_lm import load, generate
+from mlx_lm.sample_utils import make_sampler
 from score_model import EfficientScorer
-import numpy as np
 
 
 class ParallelInferenceEngine:
@@ -46,13 +46,18 @@ class ParallelInferenceEngine:
         seed: int
     ) -> str:
         """Generate a single response"""
+        # Set seed for this generation
+        mx.random.seed(seed)
+        
+        # Create sampler with temperature
+        sampler = make_sampler(temp=temperature)
+        
         response = generate(
             self.model,
             self.tokenizer,
             prompt=prompt,
             max_tokens=max_tokens,
-            temp=temperature,
-            seed=seed,
+            sampler=sampler,
             verbose=False
         )
         return prompt + response
@@ -62,9 +67,10 @@ class ParallelInferenceEngine:
         prompt: str,
         n_candidates: int,
         max_tokens: int = 32768,
-        temperature: float = 0.6
+        temperature: float = 0.6,
+        verbose: bool = False
     ) -> List[str]:
-        """Generate multiple candidates in parallel"""
+        """Generate multiple candidates (sequentially to avoid Metal conflicts)"""
         
         # Format prompt
         messages = [{"role": "user", "content": prompt}]
@@ -74,30 +80,39 @@ class ParallelInferenceEngine:
             add_generation_prompt=True
         )
         
-        # Create tasks for parallel generation
-        tasks = []
+        # Generate sequentially to avoid Metal command buffer conflicts
+        candidates = []
         base_seed = int(time.time() * 1000)
         
         for i in range(n_candidates):
-            task = self.executor.submit(
-                self.generate_single,
+            # Show progress bar (always show, not just in verbose mode)
+            progress = i + 1
+            bar_length = 30
+            filled = int(bar_length * (i) / n_candidates)
+            bar = '█' * filled + '░' * (bar_length - filled)
+            print(f"\rGenerating: [{bar}] {i}/{n_candidates} candidates", end='', flush=True)
+            
+            candidate = self.generate_single(
                 formatted_prompt,
                 max_tokens,
                 temperature,
                 base_seed + i
             )
-            tasks.append(task)
+            candidates.append(candidate)
+            
+            # Update progress bar after completion
+            filled = int(bar_length * progress / n_candidates)
+            bar = '█' * filled + '░' * (bar_length - filled)
+            print(f"\rGenerating: [{bar}] {progress}/{n_candidates} candidates", end='', flush=True)
         
-        # Collect results
-        candidates = []
-        for task in tasks:
-            candidates.append(task.result())
+        print()  # New line after progress bar
         
         return candidates
     
     def score_parallel(
         self,
-        candidates: List[str]
+        candidates: List[str],
+        verbose: bool = False
     ) -> List[float]:
         """Score multiple candidates in parallel"""
         
@@ -165,14 +180,12 @@ class ParallelInferenceEngine:
         start_time = time.time()
         
         # Phase 1: Generate candidates
-        if verbose:
-            print(f"Generating {n_branches} candidates...")
-        
         candidates = self.generate_parallel(
             prompt,
             n_branches,
             max_tokens,
-            temperature
+            temperature,
+            verbose=verbose
         )
         
         gen_time = time.time() - start_time
@@ -182,11 +195,11 @@ class ParallelInferenceEngine:
             print(f"Scoring {n_branches} candidates...")
         
         score_start = time.time()
-        scores = self.score_parallel(candidates)
+        scores = self.score_parallel(candidates, verbose=verbose)
         score_time = time.time() - score_start
         
         # Phase 3: Select best
-        best_idx = np.argmax(scores)
+        best_idx = int(mx.argmax(mx.array(scores)))
         best_candidate = candidates[best_idx]
         best_score = scores[best_idx]
         
@@ -198,10 +211,16 @@ class ParallelInferenceEngine:
             add_generation_prompt=True
         )
         
-        if best_candidate.startswith(prompt_template):
-            response = best_candidate[len(prompt_template):]
-        else:
-            response = best_candidate
+        # Process all candidates to extract responses
+        all_responses = []
+        for candidate in candidates:
+            if candidate.startswith(prompt_template):
+                all_responses.append(candidate[len(prompt_template):])
+            else:
+                all_responses.append(candidate)
+        
+        # Get best response
+        response = all_responses[best_idx]
         
         total_time = time.time() - start_time
         
@@ -211,12 +230,13 @@ class ParallelInferenceEngine:
             "response": response,
             "score": float(best_score),
             "all_scores": [float(s) for s in scores],
+            "all_responses": all_responses,  # Add all candidate responses
+            "best_idx": best_idx,
             "timing": {
                 "generation": gen_time,
                 "scoring": score_time,
                 "total": total_time
-            },
-            "cache_hits": len([s for s in scores if s is not None]) - len(uncached_candidates)
+            }
         }
     
     def cleanup(self):
@@ -318,7 +338,7 @@ class AsyncInferenceEngine(ParallelInferenceEngine):
         score_time = time.time() - score_start
         
         # Select best
-        best_idx = np.argmax(scores)
+        best_idx = int(mx.argmax(mx.array(scores)))
         best_candidate = candidates[best_idx]
         best_score = scores[best_idx]
         
@@ -380,8 +400,8 @@ def benchmark_modes(
             scores.append(result["score"])
         
         results[mode] = {
-            "avg_time": np.mean(times),
-            "avg_score": np.mean(scores),
+            "avg_time": float(mx.mean(mx.array(times))),
+            "avg_score": float(mx.mean(mx.array(scores))),
             "branches": result["branches"]
         }
     

@@ -11,8 +11,8 @@ from typing import List, Dict, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load, generate
+from mlx_lm.sample_utils import make_sampler
 from mlx_lm.utils import load_model
-import numpy as np
 
 
 class XBaiInference:
@@ -72,13 +72,18 @@ class XBaiInference:
                 print(f"Generating candidate {i+1}/{n_candidates}...")
             
             # Generate with different seeds for diversity
+            # Set seed for this generation
+            mx.random.seed(int(time.time() * 1000) + i)
+            
+            # Create sampler with temperature
+            sampler = make_sampler(temp=self.temperature)
+            
             response = generate(
                 self.model,
                 self.tokenizer,
                 prompt=formatted_prompt,
                 max_tokens=self.max_tokens,
-                temp=self.temperature,
-                seed=int(time.time() * 1000) + i,
+                sampler=sampler,
                 verbose=False
             )
             
@@ -101,7 +106,7 @@ class XBaiInference:
             scores.append(score)
         
         # Select best
-        best_idx = np.argmax(scores)
+        best_idx = int(mx.argmax(mx.array(scores)))
         best_solution = candidates[best_idx]
         best_score = scores[best_idx]
         
@@ -225,7 +230,7 @@ class ScoreModel:
             score += 0.1
         
         # Add some randomness for demo
-        score += np.random.uniform(-0.1, 0.1)
+        score += float(mx.random.uniform(low=-0.1, high=0.1, shape=()))
         
         return min(max(score, 0.0), 1.0)
 

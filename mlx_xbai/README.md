@@ -179,17 +179,17 @@ python xbai_cli.py --model-path /path/to/model --mode medium \
 
 ## Limitations
 
-- The current implementation uses a simplified scoring model (full PRM integration pending)
 - Requires model weights in MLX-compatible format
 - Performance depends on available RAM and compute
+- Score model requires trained weights file (score_head.npz)
 
 ## Contributing
 
 Contributions welcome! Areas for improvement:
-- Full Process Reward Model integration
 - Model quantization support
 - Streaming generation
 - Web UI interface
+- Performance optimizations for larger batch sizes
 
 ## License
 

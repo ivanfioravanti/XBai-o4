@@ -26,7 +26,7 @@ def print_result(result: dict, verbose: bool = False):
     """Pretty print inference result"""
     print(f"\n{'='*50}")
     print(f"Mode: {result['mode'].upper()} ({result['branches']} branches)")
-    print(f"Score: {result['score']:.4f}")
+    print(f"Best Score: {result['score']:.4f}")
     print(f"Time: {result['timing']['total']:.2f}s")
     
     if verbose:
@@ -37,13 +37,26 @@ def print_result(result: dict, verbose: bool = False):
         if 'cache_hits' in result:
             print(f"  Cache hits: {result['cache_hits']}")
         
-        print(f"\nScore distribution: {result['all_scores']}")
-    
-    print(f"\n{'='*50}")
-    print("Response:")
-    print("-"*50)
-    print(result['response'])
-    print("-"*50)
+        # Show all candidates with scores
+        if 'all_responses' in result:
+            print(f"\n{'='*50}")
+            print(f"ALL CANDIDATE RESPONSES ({result['branches']} total):")
+            print("="*50)
+            
+            for i, (response, score) in enumerate(zip(result['all_responses'], result['all_scores'])):
+                is_best = i == result.get('best_idx', -1)
+                marker = " ✅" if is_best else " ❌"
+                print(f"\nCandidate {i+1} (Score: {score:.4f}){marker}:")
+                print("-"*50)
+                print(response)
+                print("-"*50)
+    else:
+        # Non-verbose: show only the selected response
+        print(f"\n{'='*50}")
+        print("Selected Response:")
+        print("-"*50)
+        print(result['response'])
+        print("-"*50)
 
 
 def interactive_mode(engine: ParallelInferenceEngine, args):
@@ -309,6 +322,7 @@ Examples:
     
     parser.add_argument(
         "--async",
+        dest="async_mode",
         action="store_true",
         help="Use async processing for batch mode"
     )
@@ -322,7 +336,7 @@ Examples:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Verbose output"
+        help="Verbose output (shows all candidates, timing details, and scores)"
     )
     
     args = parser.parse_args()
@@ -335,7 +349,7 @@ Examples:
         args.interactive = False
     
     # Initialize engine
-    if args.async and args.input:
+    if args.async_mode and args.input:
         engine = AsyncInferenceEngine(
             args.model_path,
             max_workers=args.max_workers
@@ -358,7 +372,7 @@ Examples:
         
         elif args.input:
             # Batch mode
-            if args.async:
+            if args.async_mode:
                 asyncio.run(async_batch_mode(engine, args))
             else:
                 batch_mode(engine, args)
@@ -387,7 +401,6 @@ Examples:
     
     finally:
         engine.cleanup()
-        print("\nGoodbye!")
 
 
 if __name__ == "__main__":
