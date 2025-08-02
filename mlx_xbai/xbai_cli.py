@@ -120,7 +120,7 @@ def print_result(result: dict, verbose: bool = False):
     else:
         # Non-verbose: show only the selected response (always in full)
         print(f"\n{'='*50}")
-        print("SELECTED RESPONSE (Full):")
+        print(f"SELECTED RESPONSE (Score: {best_score:.4f}):")
         print("-"*50)
         print(result['response'])
         print("-"*50)
