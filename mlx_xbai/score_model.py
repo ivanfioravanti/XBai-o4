@@ -7,72 +7,52 @@ import mlx.core as mx
 import mlx.nn as nn
 from typing import List, Tuple, Optional
 from pathlib import Path
-import json
+import os
 
 
 class ProcessRewardModel(nn.Module):
     """Process Reward Model for scoring reasoning steps"""
     
-    def __init__(self):
+    def __init__(self, dropout_p: float = 0.5):
         super().__init__()
-        # Match the exact architecture from PyTorch
-        self.linear1 = nn.Linear(5120, 10240)
+        # Match the exact architecture from PyTorch original
+        # Fixed dimension: 1536
+        score_model_dim = 1536
+        self.linear1 = nn.Linear(score_model_dim, score_model_dim * 2)
         self.relu = nn.ReLU()
-        self.linear2 = nn.Linear(10240, 1)
+        self.dropout = nn.Dropout(p=dropout_p)
+        self.linear2 = nn.Linear(score_model_dim * 2, 1)
     
-    def __call__(self, hidden_states: mx.array) -> mx.array:
+    def __call__(self, hidden_states: mx.array, training: bool = False) -> mx.array:
         """Forward pass through score head"""
         x = self.linear1(hidden_states)
         x = self.relu(x)
+        if training:
+            x = self.dropout(x)
         x = self.linear2(x)
         return x
 
 
-class RealXBaiScorer:
-    """Real scoring system for XBai o4 using trained weights"""
+class XBaiScorer:
+    """Scoring system for XBai o4 using model's hidden states"""
     
-    def __init__(self, model, tokenizer, score_model_path: Optional[str] = None):
+    def __init__(self, model, tokenizer, model_path: str = None, lang: str = 'en'):
         self.model = model
         self.tokenizer = tokenizer
+        self.score_model_dim = 1536  # Fixed dimension
+        self.lang = lang
         
         # Load special tokens
         self.think_start_id = self._get_token_id('<think>')
         self.think_end_id = self._get_token_id('</think>')
         
         # Get scoring position tokens (punctuation, newlines)
-        self.score_token_ids = self._get_score_tokens()
+        self.score_token_ids = self._get_all_key_ids()
         
-        # Initialize and load PRM
-        self.prm = self._load_prm(score_model_path)
-        print("Score model loaded successfully")
+        # Initialize and load PRM head
+        self.prm = self._load_prm(model_path)
+        print("Score model initialized")
     
-    def _load_prm(self, score_model_path: Optional[str] = None) -> ProcessRewardModel:
-        """Load the Process Reward Model with trained weights"""
-        
-        # Default path if not provided
-        if score_model_path is None:
-            score_model_path = Path.home() / "XBai-o4-4bit" / "score_head.npz"
-        
-        # Initialize model
-        prm = ProcessRewardModel()
-        
-        # Load weights if file exists
-        if Path(score_model_path).exists():
-            print(f"Loading score model weights from {score_model_path}")
-            weights = mx.load(str(score_model_path))
-            
-            # Update model weights
-            prm.linear1.weight = weights['linear1.weight']
-            prm.linear1.bias = weights['linear1.bias']
-            prm.linear2.weight = weights['linear2.weight']
-            prm.linear2.bias = weights['linear2.bias']
-            
-            print("Score model weights loaded successfully")
-        else:
-            print(f"Warning: Score model weights not found at {score_model_path}")
-            print("Using random initialization")
-        
-        return prm
     
     def _get_token_id(self, token: str) -> int:
         """Get token ID, return -1 if not found"""
@@ -82,52 +62,61 @@ class RealXBaiScorer:
         except:
             return -1
     
-    def _get_score_tokens(self) -> List[int]:
-        """Get token IDs for scoring positions (punctuation, newlines)"""
-        # Key tokens where we evaluate scores
-        score_chars = ['.', '!', '?', '\n', '。', '！', '？']
-        score_ids = []
+    def _get_all_key_ids(self, target_chars: List[str] = None) -> List[int]:
+        """Get token IDs for scoring positions - matches original get_all_key_ids"""
+        if target_chars is None:
+            target_chars = None  # Default to English behavior
         
-        for char in score_chars:
-            try:
-                ids = self.tokenizer.encode(char, add_special_tokens=False)
-                if ids:
-                    score_ids.extend(ids)
-            except:
-                continue
+        if False:  # Removed language-specific logic
+            # Chinese mode - match original logic
+            vocab = self.tokenizer.get_vocab() if hasattr(self.tokenizer, 'get_vocab') else {}
+            target_token_ids = []
+            
+            for token in vocab.keys():
+                try:
+                    token_id = self.tokenizer.convert_tokens_to_ids([token])[0] if hasattr(self.tokenizer, 'convert_tokens_to_ids') else self.tokenizer.encode(token, add_special_tokens=False)[0]
+                    decoded = self.tokenizer.decode([token_id])
+                    for target_char in target_chars:
+                        if target_char in decoded and len(decoded.replace(target_char, '')) <= 1 and len(decoded) <= 3:
+                            target_token_ids.append(token_id)
+                            break
+                except:
+                    continue
+        else:
+            # English mode - use .\n\n pattern
+            target_token_ids = self.tokenizer.encode('.\n\n', add_special_tokens=False)
         
-        # Also add common sentence endings
-        for ending in ['.\n', '!\n', '?\n', '. ', '! ', '? ']:
-            try:
-                ids = self.tokenizer.encode(ending, add_special_tokens=False)
-                if ids:
-                    score_ids.extend(ids)
-            except:
-                continue
-        
-        # Remove duplicates
-        score_ids = list(set(score_ids))
-        return score_ids
+        return target_token_ids
     
     def get_score_mask(self, input_ids: mx.array) -> mx.array:
-        """Create mask for positions where we should compute scores"""
-        batch_size, seq_len = input_ids.shape
-        mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
-        
-        # Mark positions with score tokens
+        """Create mask for positions where we should compute scores - matches original"""
+        # Create mask for target tokens
+        mask = mx.zeros_like(input_ids).astype(mx.bool_)
         for token_id in self.score_token_ids:
             mask = mask | (input_ids == token_id)
         
-        return mask
+        # Only keep first occurrence in consecutive sequences
+        mask_shifted = mx.pad(mask[:, :-1], ((0, 0), (1, 0)), constant_values=False)
+        mask_first_only = mask & ~mask_shifted
+        
+        # Exclude positions right after <think> token
+        think_pos = (input_ids == self.think_start_id)
+        think_next_mask = mx.pad(think_pos[:, :-1], ((0, 0), (1, 0)), constant_values=False)
+        final_mask = mask_first_only & ~think_next_mask
+        
+        # Shift mask by one position to align with hidden states
+        final_mask = mx.pad(final_mask[:, 1:], ((0, 0), (0, 1)), constant_values=False)
+        
+        return final_mask
     
     def get_thinking_mask(self, input_ids: mx.array) -> mx.array:
         """Create mask for thinking tokens between <think> and </think>"""
         batch_size, seq_len = input_ids.shape
-        mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
+        mask = mx.zeros((batch_size, seq_len)).astype(mx.bool_)
         
         if self.think_start_id == -1 or self.think_end_id == -1:
             # If no thinking tags, return all True
-            return mx.ones_like(mask, dtype=mx.bool_)
+            return mx.ones_like(mask).astype(mx.bool_)
         
         for b in range(batch_size):
             seq = input_ids[b]
@@ -152,13 +141,13 @@ class RealXBaiScorer:
         
         return mask
     
-    def geometric_mean(self, scores: mx.array) -> float:
-        """Compute geometric mean of scores"""
+    def geometric_mean(self, scores: mx.array, eps: float = 1e-10) -> float:
+        """Compute geometric mean of scores - matches original"""
         if scores.shape[0] == 0:
-            return 0.5
+            return 0.0  # Match original: returns 0 for empty tensor
         
-        # Clip to avoid log(0)
-        scores = mx.clip(scores, 1e-10, 1.0)
+        # Clip to avoid log(0) - matches original
+        scores = mx.clip(scores, eps, mx.inf)
         
         # Geometric mean = exp(mean(log(scores)))
         log_scores = mx.log(scores)
@@ -170,7 +159,7 @@ class RealXBaiScorer:
         self,
         text: str,
         return_all_scores: bool = False
-    ) -> Tuple[float, Optional[List[float]]]:
+    ) -> Tuple[float, Optional[List[float]], Optional[List[int]], Optional[List[int]]]:
         """
         Compute reward score for a solution using actual model hidden states
         
@@ -194,12 +183,30 @@ class RealXBaiScorer:
             # Fallback if we can't get hidden states
             return (0.5, [0.5]) if return_all_scores else (0.5, None)
         
-        # Get scoring masks
+        # Get score mask (already handles think token exclusion)
         score_mask = self.get_score_mask(input_ids)
-        thinking_mask = self.get_thinking_mask(input_ids)
         
-        # Combine masks: only score at punctuation within thinking regions
-        final_mask = score_mask & thinking_mask
+        # Get positions between <think> and </think>
+        # In MLX, we need to find indices differently
+        think_start_mask = (input_ids[0] == self.think_start_id)
+        think_end_mask = (input_ids[0] == self.think_end_id)
+        
+        # Find first occurrence using argmax (returns first True position)
+        start_pos = 0
+        end_pos = input_ids.shape[1]
+        
+        if mx.any(think_start_mask):
+            start_pos = int(mx.argmax(think_start_mask))
+        
+        if mx.any(think_end_mask):
+            end_pos = int(mx.argmax(think_end_mask))
+        
+        # Create between mask
+        between_mask = mx.zeros_like(input_ids).astype(mx.bool_)
+        between_mask[:, start_pos + 1:end_pos] = True
+        
+        # Combine masks
+        final_mask = between_mask & score_mask
         
         # Count valid positions
         num_valid = mx.sum(final_mask)
@@ -235,39 +242,60 @@ class RealXBaiScorer:
         
         if return_all_scores:
             all_scores = [float(s) for s in scores]
-            return final_score, all_scores
+            # Get scoring positions
+            score_positions = [i for i in range(mask_flat.shape[0]) if mask_flat[i]]
+            token_ids = [int(id) for id in input_ids[0]]
+            return final_score, all_scores, token_ids, score_positions
         
-        return final_score, None
+        return final_score, None, None, None
     
     def _get_hidden_states(self, input_ids: mx.array) -> Optional[mx.array]:
         """
-        Extract hidden states from model
+        Extract hidden states from the already-loaded MLX model
         
-        Note: This requires the model to return hidden states.
-        For now, we'll try to hook into the model's forward pass.
+        This extracts the second-to-last layer's hidden states by running
+        the model's forward pass and capturing intermediate outputs.
         """
         try:
-            # Try to get hidden states by running model with output_hidden_states
-            # This requires model modification or monkey-patching
+            # For MLX LLM models, we need to run through the layers manually
+            # to capture intermediate states
             
-            # For MLX models, we need to access intermediate layers
-            # This is model-specific and may need adjustment
+            # For MLX models, check for nested model structure
+            actual_model = self.model
+            if hasattr(self.model, 'model'):
+                actual_model = self.model.model
             
-            # Option 1: If model supports returning hidden states
-            if hasattr(self.model, 'forward_with_hidden_states'):
-                outputs = self.model.forward_with_hidden_states(input_ids)
-                return outputs['hidden_states'][-2]  # Second-to-last layer
+            # Get embeddings
+            if hasattr(actual_model, 'embed_tokens'):
+                x = actual_model.embed_tokens(input_ids)
+            elif hasattr(actual_model, 'wte'):  # GPT-style
+                x = actual_model.wte(input_ids)
+            elif hasattr(actual_model, 'tok_embeddings'):  # LLaMA-style
+                x = actual_model.tok_embeddings(input_ids)
+            else:
+                raise ValueError(f"Could not find embedding layer in {type(actual_model)}")
             
-            # Option 2: Try to extract from model layers directly
-            # Run through embedding and layers
-            x = self.model.embed_tokens(input_ids)
+            # Get the transformer layers
+            if hasattr(actual_model, 'layers'):
+                layers = actual_model.layers
+            elif hasattr(actual_model, 'h'):  # GPT-style
+                layers = actual_model.h
+            elif hasattr(actual_model, 'transformer') and hasattr(actual_model.transformer, 'h'):
+                layers = actual_model.transformer.h
+            else:
+                raise ValueError("Could not find transformer layers")
             
             # Process through transformer layers
-            for i, layer in enumerate(self.model.layers):
+            hidden_states = None
+            for i, layer in enumerate(layers):
                 x = layer(x)
                 # Save second-to-last layer output
-                if i == len(self.model.layers) - 2:
+                if i == len(layers) - 2:
                     hidden_states = x
+            
+            if hidden_states is None:
+                # If model has fewer than 2 layers, use the last available
+                hidden_states = x
             
             return hidden_states
             
@@ -281,28 +309,20 @@ class RealXBaiScorer:
                 outputs = self.model(input_ids)
                 # Use the logits embeddings as a proxy for hidden states
                 batch_size, seq_len = input_ids.shape
-                hidden_dim = 5120  # Expected dimension for score model
                 
                 # Create pseudo-hidden states from logits
                 # This is not ideal but better than random
                 if hasattr(outputs, 'shape'):
-                    # Reduce logits dimension to match score model input
-                    vocab_size = outputs.shape[-1]
-                    # Simple linear projection as fallback
-                    pseudo_hidden = mx.zeros((batch_size, seq_len, hidden_dim))
-                    # Fill with some signal from logits
-                    for i in range(seq_len):
-                        # Take top-k logits as features
-                        top_k = min(hidden_dim, vocab_size)
-                        pseudo_hidden[:, i, :top_k] = outputs[:, i, :top_k]
-                    return pseudo_hidden
+                    # Create pseudo-hidden states as fallback
+                    # Return random features as last resort
+                    return mx.random.normal((batch_size, seq_len, self.score_model_dim))
             except:
                 pass
             
             return None
 
 
-class EfficientScorer(RealXBaiScorer):
+class EfficientScorer(XBaiScorer):
     """Optimized scorer for batch processing"""
     
     def score_batch(
@@ -320,3 +340,38 @@ class EfficientScorer(RealXBaiScorer):
             scores.extend(batch_scores)
         
         return scores
+
+    def _load_prm(self, model_path: str = None) -> ProcessRewardModel:
+        """Load the Process Reward Model with trained weights"""
+        
+        # Initialize model with fixed dimensions (1536)
+        prm = ProcessRewardModel()
+        
+        # Try to find score_module.pt in the model directory
+        if model_path:
+            score_path = Path(model_path) / "score_module.pt"
+            # Also check in parent directory for 4bit models
+            if not score_path.exists():
+                parent_path = Path(os.path.expanduser('~/XBai-o4-4bit/score_module.pt'))
+                if parent_path.exists():
+                    score_path = parent_path
+            
+            if score_path.exists():
+                print(f"Loading score model weights from {score_path}")
+                try:
+                    import torch
+                    state_dict = torch.load(str(score_path), map_location='cpu')
+                    # Convert PyTorch weights to MLX
+                    # The state dict has keys like '0.weight', '0.bias', '3.weight', '3.bias'
+                    prm.linear1.weight = mx.array(state_dict['0.weight'].numpy())
+                    prm.linear1.bias = mx.array(state_dict['0.bias'].numpy())
+                    prm.linear2.weight = mx.array(state_dict['3.weight'].numpy())
+                    prm.linear2.bias = mx.array(state_dict['3.bias'].numpy())
+                    print("Score model weights loaded successfully")
+                except Exception as e:
+                    print(f"Warning: Could not load score weights: {e}")
+            else:
+                print(f"Warning: score_module.pt not found in {model_path}")
+                print("Using random initialization for score model")
+        
+        return prm

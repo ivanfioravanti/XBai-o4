@@ -13,6 +13,7 @@ import mlx.nn as nn
 from mlx_lm import load, generate
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.utils import load_model
+from score_model import XBaiScorer
 
 
 class XBaiInference:
@@ -44,8 +45,12 @@ class XBaiInference:
         print(f"Loading model from {model_path}...")
         self.model, self.tokenizer = load(str(model_path))
         
-        # Initialize score model
-        self.score_model = ScoreModel(self.model, self.tokenizer)
+        # Initialize scorer with the already-loaded model
+        self.score_model = XBaiScorer(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            model_path=str(self.model_path)
+        )
         
         if verbose:
             print(f"Model loaded. Using {mode} mode with {self.branch} branches")
@@ -54,10 +59,16 @@ class XBaiInference:
         self,
         prompt: str,
         n_candidates: int
-    ) -> List[str]:
-        """Generate multiple candidate solutions"""
+    ) -> Tuple[List[str], List[float], Dict]:
+        """Generate multiple candidate solutions with timing stats
+        
+        Returns:
+            Tuple of (candidates, generation_times, timing_stats)
+        """
         
         candidates = []
+        generation_times = []
+        tokens_generated = []
         
         # Format prompt with chat template
         messages = [{"role": "user", "content": prompt}]
@@ -66,6 +77,9 @@ class XBaiInference:
             tokenize=False,
             add_generation_prompt=True
         )
+        
+        # Get prompt token count
+        prompt_tokens = len(self.tokenizer.encode(formatted_prompt))
         
         for i in range(n_candidates):
             if self.verbose:
@@ -78,6 +92,7 @@ class XBaiInference:
             # Create sampler with temperature
             sampler = make_sampler(temp=self.temperature)
             
+            gen_start = time.time()
             response = generate(
                 self.model,
                 self.tokenizer,
@@ -86,24 +101,60 @@ class XBaiInference:
                 sampler=sampler,
                 verbose=False
             )
+            gen_time = time.time() - gen_start
             
-            candidates.append(formatted_prompt + response)
+            full_text = formatted_prompt + response
+            candidates.append(full_text)
+            generation_times.append(gen_time)
+            
+            # Calculate tokens generated
+            total_tokens = len(self.tokenizer.encode(full_text))
+            output_tokens = total_tokens - prompt_tokens
+            tokens_generated.append(output_tokens)
         
-        return candidates
+        # Calculate generation statistics
+        total_gen_time = sum(generation_times)
+        avg_gen_time = total_gen_time / n_candidates if n_candidates > 0 else 0
+        total_tokens = sum(tokens_generated)
+        avg_tokens_per_sec = total_tokens / total_gen_time if total_gen_time > 0 else 0
+        
+        timing_stats = {
+            "total_generation_time": total_gen_time,
+            "avg_generation_time": avg_gen_time,
+            "individual_times": generation_times,
+            "tokens_generated": tokens_generated,
+            "total_tokens": total_tokens,
+            "avg_tokens_per_second": avg_tokens_per_sec,
+            "prompt_tokens": prompt_tokens
+        }
+        
+        return candidates, generation_times, timing_stats
     
     def select_best_solution(
         self,
-        candidates: List[str]
-    ) -> Tuple[str, float, List[float]]:
-        """Score all candidates and select the best one"""
+        candidates: List[str],
+        generation_times: List[float],
+        timing_stats: Dict
+    ) -> Tuple[str, float, List[float], Dict]:
+        """Score all candidates and select the best one
+        
+        Returns:
+            Tuple of (best_solution, best_score, all_scores, scoring_details)
+        """
         
         scores = []
+        scoring_times = []
+        
         for i, candidate in enumerate(candidates):
             if self.verbose:
                 print(f"Scoring candidate {i+1}/{len(candidates)}...")
             
+            score_start = time.time()
             score = self.score_model.compute_score(candidate)
+            score_time = time.time() - score_start
+            
             scores.append(score)
+            scoring_times.append(score_time)
         
         # Select best
         best_idx = int(mx.argmax(mx.array(scores)))
@@ -125,34 +176,81 @@ class XBaiInference:
             if response_start != -1:
                 best_solution = best_solution[response_start + len("assistant\n"):]
         
-        return best_solution, best_score, scores
+        # Create detailed scoring info
+        scoring_details = {
+            "best_idx": best_idx,
+            "scoring_times": scoring_times,
+            "total_scoring_time": sum(scoring_times),
+            "avg_scoring_time": sum(scoring_times) / len(scoring_times) if scoring_times else 0
+        }
+        
+        return best_solution, best_score, scores, scoring_details
     
     def run(self, prompt: str) -> Dict:
         """Run inference with selected mode"""
         
         start_time = time.time()
         
-        # Generate candidates
-        candidates = self.generate_candidates(prompt, self.branch)
+        # Generate candidates with timing
+        candidates, gen_times, gen_stats = self.generate_candidates(prompt, self.branch)
         
-        # Select best
-        best_solution, best_score, all_scores = self.select_best_solution(candidates)
+        gen_phase_time = time.time() - start_time
+        score_phase_start = time.time()
         
+        # Select best and score all
+        best_solution, best_score, all_scores, scoring_details = self.select_best_solution(
+            candidates, gen_times, gen_stats
+        )
+        
+        score_phase_time = time.time() - score_phase_start
         elapsed = time.time() - start_time
+        
+        # Create response details for all candidates
+        response_details = []
+        for i in range(len(candidates)):
+            response_details.append({
+                "index": i,
+                "score": float(all_scores[i]),
+                "generation_time": gen_times[i],
+                "tokens_generated": gen_stats["tokens_generated"][i],
+                "tokens_per_second": gen_stats["tokens_generated"][i] / gen_times[i] if gen_times[i] > 0 else 0
+            })
+        
+        # Sort by score
+        sorted_responses = sorted(response_details, key=lambda x: x["score"], reverse=True)
         
         result = {
             "mode": self.mode,
             "branches": self.branch,
             "solution": best_solution,
-            "score": float(best_score),
+            "best_response": {
+                "text": best_solution,
+                "score": float(best_score),
+                "index": scoring_details["best_idx"],
+                "generation_time": gen_times[scoring_details["best_idx"]],
+                "tokens_generated": gen_stats["tokens_generated"][scoring_details["best_idx"]]
+            },
             "all_scores": [float(s) for s in all_scores],
-            "time": elapsed
+            "response_details": response_details,
+            "sorted_responses": sorted_responses,
+            "generation_stats": gen_stats,
+            "scoring_stats": scoring_details,
+            "timing": {
+                "generation_phase": gen_phase_time,
+                "scoring_phase": score_phase_time,
+                "total": elapsed,
+                "avg_generation_per_candidate": gen_stats["avg_generation_time"],
+                "avg_scoring_per_candidate": scoring_details["avg_scoring_time"],
+                "tokens_per_second": gen_stats["avg_tokens_per_second"]
+            }
         }
         
         if self.verbose:
             print(f"\nCompleted in {elapsed:.2f}s")
+            print(f"Generation: {gen_phase_time:.2f}s ({gen_stats['avg_tokens_per_second']:.1f} tok/s)")
+            print(f"Scoring: {score_phase_time:.2f}s")
             print(f"Best score: {best_score:.4f}")
-            print(f"Score distribution: {all_scores}")
+            print(f"Score distribution: Min={min(all_scores):.4f}, Max={max(all_scores):.4f}, Avg={sum(all_scores)/len(all_scores):.4f}")
         
         return result
 
@@ -321,10 +419,22 @@ def main():
         result['prompt'] = prompt
         results.append(result)
         
-        print(f"\nBest solution (score: {result['score']:.4f}):")
+        print(f"\nBest solution (score: {result['best_response']['score']:.4f}):")
         print("-" * 50)
         print(result['solution'])
         print("-" * 50)
+        
+        # Show generation statistics
+        print(f"\nGeneration Statistics:")
+        print(f"  Total time: {result['timing']['total']:.2f}s")
+        print(f"  Generation: {result['timing']['generation_phase']:.2f}s")
+        print(f"  Scoring: {result['timing']['scoring_phase']:.2f}s")
+        print(f"  Tokens/sec: {result['timing']['tokens_per_second']:.1f}")
+        
+        # Show all scores
+        print(f"\nAll Response Scores:")
+        for i, detail in enumerate(result['sorted_responses'][:5]):  # Show top 5
+            print(f"  {i+1}. Score: {detail['score']:.4f} | Time: {detail['generation_time']:.1f}s | Tokens: {detail['tokens_generated']}")
     
     # Save results
     with open(args.output, 'w') as f:

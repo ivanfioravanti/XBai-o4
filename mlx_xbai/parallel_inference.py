@@ -28,8 +28,12 @@ class ParallelInferenceEngine:
         # Load model and tokenizer
         self.model, self.tokenizer = load(model_path)
         
-        # Initialize scorer
-        self.scorer = EfficientScorer(self.model, self.tokenizer)
+        # Initialize scorer with the already-loaded model
+        self.scorer = EfficientScorer(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            model_path=model_path
+        )
         
         # Cache for score results
         self.score_cache = {}
@@ -69,8 +73,12 @@ class ParallelInferenceEngine:
         max_tokens: int = 32768,
         temperature: float = 0.6,
         verbose: bool = False
-    ) -> List[str]:
-        """Generate multiple candidates (sequentially to avoid Metal conflicts)"""
+    ) -> Tuple[List[str], List[float], Dict]:
+        """Generate multiple candidates (sequentially to avoid Metal conflicts)
+        
+        Returns:
+            Tuple of (candidates, generation_times, timing_stats)
+        """
         
         # Format prompt
         messages = [{"role": "user", "content": prompt}]
@@ -80,8 +88,13 @@ class ParallelInferenceEngine:
             add_generation_prompt=True
         )
         
+        # Tokenize prompt to get token count
+        prompt_tokens = len(self.tokenizer.encode(formatted_prompt))
+        
         # Generate sequentially to avoid Metal command buffer conflicts
         candidates = []
+        generation_times = []
+        tokens_generated = []
         base_seed = int(time.time() * 1000)
         
         for i in range(n_candidates):
@@ -92,13 +105,22 @@ class ParallelInferenceEngine:
             bar = '█' * filled + '░' * (bar_length - filled)
             print(f"\rGenerating: [{bar}] {i}/{n_candidates} candidates", end='', flush=True)
             
+            gen_start = time.time()
             candidate = self.generate_single(
                 formatted_prompt,
                 max_tokens,
                 temperature,
                 base_seed + i
             )
+            gen_time = time.time() - gen_start
+            
+            # Calculate tokens generated
+            candidate_tokens = len(self.tokenizer.encode(candidate))
+            output_tokens = candidate_tokens - prompt_tokens
+            
             candidates.append(candidate)
+            generation_times.append(gen_time)
+            tokens_generated.append(output_tokens)
             
             # Update progress bar after completion
             filled = int(bar_length * progress / n_candidates)
@@ -107,7 +129,23 @@ class ParallelInferenceEngine:
         
         print()  # New line after progress bar
         
-        return candidates
+        # Calculate generation statistics
+        total_gen_time = sum(generation_times)
+        avg_gen_time = total_gen_time / n_candidates
+        total_tokens = sum(tokens_generated)
+        avg_tokens_per_sec = total_tokens / total_gen_time if total_gen_time > 0 else 0
+        
+        timing_stats = {
+            "total_generation_time": total_gen_time,
+            "avg_generation_time": avg_gen_time,
+            "individual_times": generation_times,
+            "tokens_generated": tokens_generated,
+            "total_tokens": total_tokens,
+            "avg_tokens_per_second": avg_tokens_per_sec,
+            "prompt_tokens": prompt_tokens
+        }
+        
+        return candidates, generation_times, timing_stats
     
     def score_parallel(
         self,
@@ -179,8 +217,8 @@ class ParallelInferenceEngine:
         
         start_time = time.time()
         
-        # Phase 1: Generate candidates
-        candidates = self.generate_parallel(
+        # Phase 1: Generate candidates with timing stats
+        candidates, gen_times, gen_stats = self.generate_parallel(
             prompt,
             n_branches,
             max_tokens,
@@ -190,13 +228,16 @@ class ParallelInferenceEngine:
         
         gen_time = time.time() - start_time
         
-        # Phase 2: Score candidates
+        # Phase 2: Score ALL candidates
         if verbose:
             print(f"Scoring {n_branches} candidates...")
         
         score_start = time.time()
         scores = self.score_parallel(candidates, verbose=verbose)
         score_time = time.time() - score_start
+        
+        # Calculate scoring speed
+        avg_score_time = score_time / n_branches if n_branches > 0 else 0
         
         # Phase 3: Select best
         best_idx = int(mx.argmax(mx.array(scores)))
@@ -211,13 +252,26 @@ class ParallelInferenceEngine:
             add_generation_prompt=True
         )
         
-        # Process all candidates to extract responses
+        # Process all candidates to extract responses and pair with scores
         all_responses = []
-        for candidate in candidates:
+        response_details = []
+        for i, candidate in enumerate(candidates):
             if candidate.startswith(prompt_template):
-                all_responses.append(candidate[len(prompt_template):])
+                response_text = candidate[len(prompt_template):]
             else:
-                all_responses.append(candidate)
+                response_text = candidate
+            all_responses.append(response_text)
+            response_details.append({
+                "index": i,
+                "response": response_text,
+                "score": float(scores[i]),
+                "generation_time": gen_times[i],
+                "tokens_generated": gen_stats["tokens_generated"][i],
+                "tokens_per_second": gen_stats["tokens_generated"][i] / gen_times[i] if gen_times[i] > 0 else 0
+            })
+        
+        # Sort responses by score (descending)
+        sorted_responses = sorted(response_details, key=lambda x: x["score"], reverse=True)
         
         # Get best response
         response = all_responses[best_idx]
@@ -228,14 +282,25 @@ class ParallelInferenceEngine:
             "mode": mode,
             "branches": n_branches,
             "response": response,
-            "score": float(best_score),
+            "best_response": {
+                "text": response,
+                "score": float(best_score),
+                "index": best_idx,
+                "generation_time": gen_times[best_idx],
+                "tokens_generated": gen_stats["tokens_generated"][best_idx]
+            },
             "all_scores": [float(s) for s in scores],
-            "all_responses": all_responses,  # Add all candidate responses
-            "best_idx": best_idx,
+            "all_responses": all_responses,
+            "response_details": response_details,
+            "sorted_responses": sorted_responses,
+            "generation_stats": gen_stats,
             "timing": {
                 "generation": gen_time,
                 "scoring": score_time,
-                "total": total_time
+                "total": total_time,
+                "avg_generation_per_candidate": gen_stats["avg_generation_time"],
+                "avg_scoring_per_candidate": avg_score_time,
+                "tokens_per_second": gen_stats["avg_tokens_per_second"]
             }
         }
     

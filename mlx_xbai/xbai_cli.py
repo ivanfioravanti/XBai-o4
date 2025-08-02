@@ -26,34 +26,101 @@ def print_result(result: dict, verbose: bool = False):
     """Pretty print inference result"""
     print(f"\n{'='*50}")
     print(f"Mode: {result['mode'].upper()} ({result['branches']} branches)")
-    print(f"Best Score: {result['score']:.4f}")
-    print(f"Time: {result['timing']['total']:.2f}s")
+    
+    # Handle both old and new result format
+    if 'best_response' in result:
+        # New format with detailed stats
+        best_score = result['best_response']['score']
+        best_idx = result['best_response']['index']
+    else:
+        # Fallback to old format
+        best_score = result.get('score', result.get('all_scores', [0])[0] if 'all_scores' in result else 0)
+        best_idx = result.get('best_idx', 0)
+    
+    print(f"Best Score: {best_score:.4f}")
+    print(f"Total Time: {result['timing']['total']:.2f}s")
+    
+    # Always show key timing stats (even in non-verbose mode)
+    if 'generation_phase' in result['timing']:
+        print(f"  Generation: {result['timing']['generation_phase']:.2f}s")
+    else:
+        print(f"  Generation: {result['timing'].get('generation', 0):.2f}s")
+    
+    if 'scoring_phase' in result['timing']:
+        print(f"  Scoring: {result['timing']['scoring_phase']:.2f}s")
+    else:
+        print(f"  Scoring: {result['timing'].get('scoring', 0):.2f}s")
+    
+    # Show tokens per second if available
+    if 'tokens_per_second' in result['timing']:
+        print(f"  Speed: {result['timing']['tokens_per_second']:.1f} tokens/sec")
+    
+    # Show score distribution
+    if 'all_scores' in result:
+        scores = result['all_scores']
+        min_score = min(scores)
+        max_score = max(scores)
+        print(f"Score Range: [{min_score:.4f} - {max_score:.4f}]")
+    
+    # Show total tokens generated
+    if 'generation_stats' in result:
+        total_tokens = result['generation_stats'].get('total_tokens', 0)
+        print(f"Total Tokens Generated: {total_tokens}")
     
     if verbose:
-        print(f"\nTiming breakdown:")
-        print(f"  Generation: {result['timing']['generation']:.2f}s")
-        print(f"  Scoring: {result['timing']['scoring']:.2f}s")
+        # Verbose mode: show detailed stats
+        if 'generation_stats' in result:
+            stats = result['generation_stats']
+            print(f"\nGeneration Details:")
+            print(f"  Prompt tokens: {stats.get('prompt_tokens', 'N/A')}")
+            print(f"  Total tokens generated: {stats.get('total_tokens', 'N/A')}")
+            print(f"  Avg tokens/response: {stats.get('total_tokens', 0) / result['branches']:.0f}")
         
         if 'cache_hits' in result:
             print(f"  Cache hits: {result['cache_hits']}")
         
-        # Show all candidates with scores
-        if 'all_responses' in result:
+        # Show sorted responses if available
+        if 'sorted_responses' in result:
+            print(f"\n{'='*50}")
+            print(f"TOP 5 RESPONSES (by score):")
+            print("="*50)
+            
+            for i, resp_detail in enumerate(result['sorted_responses'][:5]):
+                is_best = resp_detail['index'] == best_idx
+                marker = " ✅ SELECTED" if is_best else ""
+                print(f"\n{i+1}. Score: {resp_detail['score']:.4f} | Time: {resp_detail['generation_time']:.1f}s | Tokens: {resp_detail.get('tokens_generated', 'N/A')}{marker}")
+                if i < 3:  # Show first 3 responses in verbose mode
+                    print("-"*30)
+                    # Get response text from all_responses if available
+                    if 'all_responses' in result and resp_detail['index'] < len(result['all_responses']):
+                        response_text = result['all_responses'][resp_detail['index']]
+                        # Don't truncate the selected response, truncate others
+                        if is_best:
+                            # Show full selected response
+                            print(response_text)
+                        else:
+                            # Truncate non-selected responses
+                            if len(response_text) > 300:
+                                response_text = response_text[:300] + "... [truncated]"
+                            print(response_text)
+        
+        # Show all candidates with scores (old format support)
+        elif 'all_responses' in result:
             print(f"\n{'='*50}")
             print(f"ALL CANDIDATE RESPONSES ({result['branches']} total):")
             print("="*50)
             
             for i, (response, score) in enumerate(zip(result['all_responses'], result['all_scores'])):
-                is_best = i == result.get('best_idx', -1)
+                is_best = i == best_idx
                 marker = " ✅" if is_best else " ❌"
                 print(f"\nCandidate {i+1} (Score: {score:.4f}){marker}:")
                 print("-"*50)
                 print(response)
                 print("-"*50)
     else:
-        # Non-verbose: show only the selected response
+        # Non-verbose: show only the selected response (always in full)
         print(f"\n{'='*50}")
-        print("Selected Response:")
+        print("SELECTED RESPONSE (Full):")
         print("-"*50)
         print(result['response'])
         print("-"*50)
